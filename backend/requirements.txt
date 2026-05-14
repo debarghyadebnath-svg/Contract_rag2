@@ -1,0 +1,25 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-multipart
+pymupdf
+langchain
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-qdrant
+langchain-groq
+langsmith
+qdrant-client
+langchain-nomic
+fastembed
+cohere
+langchain-cohere
+llama-cloud>=2.1
+
+# --- Contract RAG additions ---
+pdfplumber
+sentence-transformers
+chromadb
+rank-bm25
+groq
