@@ -1,48 +1,37 @@
-
 """
 contract_embedder.py
 --------------------
-Embeds contract chunks using Ollama's local embedding API (qwen3-embedding:0.6b),
+Embeds contract chunks using Cohere's embed-english-v3.0 API,
 stores dense vectors in a local Chroma persistent store, and builds a BM25
 sparse index in-memory (serialised to disk for reuse).
 
-Why Ollama for embeddings?
-  Ollama runs as a separate process, completely bypassing the Windows
-  Intel MKL / OMP thread-pool deadlock that affects SentenceTransformers
-  and raw HuggingFace inference on CPU.
+Why Cohere instead of Ollama/Qwen?
+  - No local server required (no `ollama serve` step).
+  - embed-english-v3.0 produces 1024-dim vectors with strong legal domain accuracy.
+  - Native input_type support: 'search_document' for indexing, 'search_query' for queries.
+  - Free tier: 1,000 API calls/month, up to 96 texts per call.
 
-Why local Chroma (not the existing Qdrant)?
-  The user said "use the current Qdrant db only" for the existing insurance RAG.
-  For the contract RAG we use a separate local Chroma store so neither system
-  pollutes the other's collection.
+Cohere Embed API:
+  POST https://api.cohere.com/v2/embed
+  Body: {"model": "embed-english-v3.0", "texts": [...], "input_type": "search_document", "embedding_types": ["float"]}
 
-Ollama Embed API:
-  POST http://localhost:11434/api/embed
-  Body: {"model": "qwen3-embedding:0.6b", "input": ["text1", "text2", ...]}
-  Response: {"embeddings": [[...], [...], ...]}
+Chroma pattern:
+  collection.upsert(ids, documents, embeddings, metadatas)
+  collection.query(query_embeddings=[[...]], n_results=N)
 
-Chroma API pattern (from docs):
-  client = chromadb.PersistentClient(path=...)
-  collection = client.get_or_create_collection(name, embedding_function=...)
-  collection.upsert(ids=[...], documents=[...], metadatas=[...])
-  collection.query(query_embeddings=[[...]], n_results=N, where={...})
-
-BM25 pattern (from rank-bm25 docs):
-  from rank_bm25 import BM25Okapi
-  tokenized_corpus = [doc.lower().split() for doc in documents]
-  bm25 = BM25Okapi(tokenized_corpus)
-  scores = bm25.get_scores(query.lower().split())
+BM25 pattern (rank-bm25):
+  BM25Okapi(tokenized_corpus).get_scores(tokenized_query)
 """
 
 from __future__ import annotations
 
 import json
+import os
 import pickle
 from pathlib import Path
 from typing import Any
 
 import chromadb
-import requests
 from chromadb import PersistentClient
 from rank_bm25 import BM25Okapi
 
@@ -52,20 +41,15 @@ from contract_chunker import Chunk
 # Configuration
 # ---------------------------------------------------------------------------
 
-CHROMA_DIR = Path(__file__).parent / "chroma_contract_store"
-CHROMA_COLLECTION_NAME = "ihda_contract"
+CHROMA_DIR              = Path(__file__).parent / "chroma_contract_store"
+CHROMA_COLLECTION_NAME  = "ihda_contract"
+BM25_INDEX_PATH         = Path(__file__).parent / "bm25_contract_index.pkl"
 
-# Ollama settings — model must be pulled first: `ollama pull qwen3-embedding:0.6b`
-OLLAMA_BASE_URL = "http://localhost:11434"
-EMBED_MODEL_NAME = "qwen3-embedding:0.6b"
+COHERE_MODEL            = "embed-english-v3.0"
+COHERE_EMBED_DIM        = 1024
 
-BM25_INDEX_PATH = Path(__file__).parent / "bm25_contract_index.pkl"
-
-# Batch size for Ollama embedding requests (tune up/down based on RAM)
-OLLAMA_BATCH_SIZE = 32
-
-# Prefix required by Qwen2/3 embedding models for queries
-QWEN_QUERY_PREFIX = "Represent this query for retrieving relevant documents: "
+# Cohere allows up to 96 texts per request (free tier) — keep at 90 for safety
+COHERE_BATCH_SIZE       = 90
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +65,6 @@ def _get_collection() -> chromadb.Collection:
     if _collection is None:
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
         _chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        # We provide embeddings manually, so no embedding_function needed
         _collection = _chroma_client.get_or_create_collection(
             name=CHROMA_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
@@ -89,63 +72,96 @@ def _get_collection() -> chromadb.Collection:
     return _collection
 
 
-def _get_model():
-    """
-    Returns a wrapper that mimics SentenceTransformer.encode() 
-    but sends requests to the local Ollama API.
-    """
-    class OllamaEncoder:
-        def encode(self, texts: str | list[str], normalize_embeddings: bool = True):
-            if isinstance(texts, str):
-                return _embed_batch([texts])[0]
-            return _encode_texts(texts)
-    return OllamaEncoder()
-
-
 # ---------------------------------------------------------------------------
-# Ollama embedding helper
+# Cohere embedding helper
 # ---------------------------------------------------------------------------
 
-def _check_ollama() -> None:
-    """Raise a clear error if the Ollama server is not running."""
+def _get_cohere_client():
+    """Return a Cohere client, raising clearly if the key is missing."""
     try:
-        r = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
-        r.raise_for_status()
-    except requests.ConnectionError:
-        raise RuntimeError(
-            "[embedder] Cannot reach Ollama at http://localhost:11434. "
-            "Make sure Ollama is running (`ollama serve`) and the model is "
-            f"pulled (`ollama pull {EMBED_MODEL_NAME}`)."
+        import cohere  # type: ignore[import]
+    except ImportError:
+        raise ImportError(
+            "[embedder] cohere package not installed. Run: pip install cohere"
         )
+    api_key = os.environ.get("COHERE_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "[embedder] COHERE_API_KEY not set. Add it to your .env file."
+        )
+    return cohere.ClientV2(api_key)
 
 
-def _embed_batch(texts: list[str]) -> list[list[float]]:
-    """Send a batch of texts to Ollama and return their embeddings."""
-    payload = {"model": EMBED_MODEL_NAME, "input": texts}
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/embed",
-        json=payload,
-        timeout=600,
-    )
-    response.raise_for_status()
-    return response.json()["embeddings"]
-
-
-def _encode_texts(texts: list[str]) -> list[list[float]]:
+def _embed_with_cohere(
+    texts: list[str],
+    input_type: str = "search_document",
+) -> list[list[float]]:
     """
-    Encode all texts via Ollama in batches, printing progress.
-    Returns a flat list of embedding vectors.
+    Embed texts via the Cohere API in batches.
+
+    Parameters
+    ----------
+    texts      : list of strings to embed
+    input_type : 'search_document' for indexing, 'search_query' for queries
     """
-    _check_ollama()
+    client = _get_cohere_client()
     all_embeddings: list[list[float]] = []
     total = len(texts)
-    for start in range(0, total, OLLAMA_BATCH_SIZE):
-        batch = texts[start : start + OLLAMA_BATCH_SIZE]
-        embeddings = _embed_batch(batch)
-        all_embeddings.extend(embeddings)
-        done = min(start + OLLAMA_BATCH_SIZE, total)
+
+    import time
+
+    for start in range(0, total, COHERE_BATCH_SIZE):
+        batch = texts[start : start + COHERE_BATCH_SIZE]
+        
+        # Retry loop for rate limits
+        for attempt in range(5):
+            try:
+                response = client.embed(
+                    texts=batch,
+                    model=COHERE_MODEL,
+                    input_type=input_type,
+                    embedding_types=["float"],
+                )
+                break  # success, exit retry loop
+            except Exception as exc:
+                if "429" in str(exc) or "too_many_requests" in str(exc).lower():
+                    wait = 20 * (2 ** attempt)  # Wait 20s, 40s, 80s... since limit is per minute
+                    print(f"  [embedder] Cohere rate limit hit. Waiting {wait}s before retrying...")
+                    time.sleep(wait)
+                else:
+                    raise  # Re-raise if it's a different error
+
+        # Response: EmbedByTypeResponse → .embeddings.float_ is List[List[float]]
+        batch_embeddings = response.embeddings.float_
+        all_embeddings.extend(batch_embeddings)
+        done = min(start + COHERE_BATCH_SIZE, total)
         print(f"  [embedder] {done}/{total} chunks encoded …", flush=True)
+
     return all_embeddings
+
+
+# ---------------------------------------------------------------------------
+# Wrapper to mimic SentenceTransformer.encode() interface (used in query.py)
+# ---------------------------------------------------------------------------
+
+def _get_model():
+    """
+    Returns a wrapper with .encode() that hits the Cohere API.
+    Accepts the same interface as SentenceTransformer so contract_query.py
+    doesn't need to know which backend is active.
+    """
+    class CohereEncoder:
+        def encode(
+            self,
+            texts: str | list[str],
+            normalize_embeddings: bool = True,  # kept for API compat; Cohere normalises by default
+            input_type: str = "search_query",   # default: query mode
+        ) -> list[float] | list[list[float]]:
+            if isinstance(texts, str):
+                return _embed_with_cohere([texts], input_type=input_type)[0]
+            return _embed_with_cohere(texts, input_type=input_type)
+
+    return CohereEncoder()
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +174,7 @@ def _flatten_metadata(meta: dict[str, Any]) -> dict[str, Any]:
         if isinstance(v, (str, int, float, bool)):
             flat[k] = v
         elif isinstance(v, list):
-            flat[k] = json.dumps(v)  # Chroma doesn't accept lists
+            flat[k] = json.dumps(v)
         else:
             flat[k] = str(v)
     return flat
@@ -170,7 +186,7 @@ def _flatten_metadata(meta: dict[str, Any]) -> dict[str, Any]:
 
 def embed_and_index(chunks: list[Chunk]) -> None:
     """
-    Embed all chunks via Ollama, upsert into Chroma, build BM25 index.
+    Embed all chunks via Cohere, upsert into Chroma, build BM25 index.
     Safe to call multiple times (upsert is idempotent on chunk_id).
     """
     if not chunks:
@@ -178,24 +194,21 @@ def embed_and_index(chunks: list[Chunk]) -> None:
         return
 
     collection = _get_collection()
-
-    texts = [c.page_content for c in chunks]
-    ids = [c.metadata["chunk_id"] for c in chunks]
+    texts     = [c.page_content for c in chunks]
+    ids       = [c.metadata["chunk_id"] for c in chunks]
     metadatas = [_flatten_metadata(c.metadata) for c in chunks]
 
-    print(f"[embedder] Encoding {len(texts)} chunks with Ollama/{EMBED_MODEL_NAME} …")
-    embeddings = _encode_texts(texts)
+    print(f"[embedder] Encoding {len(texts)} chunks with Cohere/{COHERE_MODEL} …")
+    embeddings = _embed_with_cohere(texts, input_type="search_document")
 
-    # Chroma upsert handles duplicates gracefully (update in place)
     collection.upsert(
         ids=ids,
         documents=texts,
         embeddings=embeddings,
         metadatas=metadatas,
     )
-    print(f"[embedder] Upserted {len(ids)} vectors into Chroma collection '{CHROMA_COLLECTION_NAME}'")
+    print(f"[embedder] Upserted {len(ids)} vectors into Chroma '{CHROMA_COLLECTION_NAME}'")
 
-    # Build and persist BM25 index
     _build_bm25_index(texts, ids)
 
 

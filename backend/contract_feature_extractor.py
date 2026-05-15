@@ -322,12 +322,13 @@ def _merge_features(chunk: Chunk, features: dict[str, Any]) -> None:
 # Public API
 # ---------------------------------------------------------------------------
 
-def enrich_chunks_with_features(chunks: list[Chunk]) -> None:
+def enrich_chunks_with_features(chunks: list[Chunk], export_excel: bool = True) -> None:
     """
     Enrich all chunks with structured features using fast heuristics.
     Zero API calls. Processes 423 chunks in under 2 seconds.
 
     Mutates chunks in-place by adding 'feat_*' fields to metadata.
+    If export_excel is True, also generates contract_features_export.xlsx directly.
     """
     import time
 
@@ -344,3 +345,71 @@ def enrich_chunks_with_features(chunks: list[Chunk]) -> None:
 
     elapsed = time.perf_counter() - t0
     print(f"[extractor] Done. {enriched}/{total} chunks enriched in {elapsed:.2f}s")
+    
+    if export_excel:
+        _export_chunks_to_excel(chunks)
+
+def _export_chunks_to_excel(chunks: list[Chunk]) -> None:
+    """Generate the Excel file directly from the in-memory chunks after extraction."""
+    import pandas as pd
+    import re
+    from pathlib import Path
+    
+    OUTPUT_FILE = "contract_features_export.xlsx"
+    print(f"[extractor] Exporting features directly to {OUTPUT_FILE}...")
+    
+    data_rows = []
+    for chunk in chunks:
+        chunk_id = chunk.metadata.get("chunk_id", "")
+        content = chunk.page_content
+        
+        row = {
+            "Chunk ID": chunk_id,
+            "Text Content": content,
+        }
+        
+        features_json = chunk.metadata.get("features_json")
+        if features_json:
+            try:
+                features = json.loads(features_json)
+                for key, val in features.items():
+                    if isinstance(val, list):
+                        row[key.replace("_", " ").title()] = ", ".join(map(str, val))
+                    else:
+                        row[key.replace("_", " ").title()] = val
+            except Exception:
+                pass
+                
+        data_rows.append(row)
+
+    df = pd.DataFrame(data_rows)
+    
+    cols = df.columns.tolist()
+    priority_cols = ["Chunk ID", "Section Id", "Chapter", "Section Title", "Content Type", "Obligation", "Risk Level"]
+    
+    new_cols = [c for c in priority_cols if c in cols]
+    new_cols += [c for c in cols if c not in new_cols and c != "Text Content"]
+    new_cols.append("Text Content") 
+    
+    df = df[new_cols]
+
+    def clean_str(s):
+        if not isinstance(s, str): return s
+        return re.sub(r'[\000-\010\013\014\016-\037]', '', s)
+
+    df = df.applymap(clean_str)
+
+    try:
+        from openpyxl.utils import get_column_letter
+        with pd.ExcelWriter(OUTPUT_FILE, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='Contract Features')
+            worksheet = writer.sheets['Contract Features']
+            for i, col in enumerate(df.columns, start=1):
+                column_len = max(df[col].astype(str).str.len().max(), len(col)) + 2
+                worksheet.column_dimensions[get_column_letter(i)].width = min(column_len, 60)
+        print(f"[extractor] Excel export successful: {Path(OUTPUT_FILE).absolute()}")
+    except Exception as e:
+        print(f"[extractor] Excel failed ({e}), falling back to CSV...")
+        OUTPUT_FILE_CSV = "contract_features_export.csv"
+        df.to_csv(OUTPUT_FILE_CSV, index=False, encoding='utf-8-sig')
+        print(f"[extractor] CSV export successful: {Path(OUTPUT_FILE_CSV).absolute()}")

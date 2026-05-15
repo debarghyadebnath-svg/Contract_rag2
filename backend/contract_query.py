@@ -19,7 +19,7 @@ from typing import Any
 
 from groq import Groq
 
-from contract_embedder import QWEN_QUERY_PREFIX, _get_collection, _get_model, load_bm25_index
+from contract_embedder import _get_collection, _get_model, load_bm25_index
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -104,9 +104,10 @@ def retrieve_contract(
         return []
 
     # --- Dense retrieval via Chroma
+    # input_type='search_query' tells Cohere to optimise this embedding for retrieval
     query_embedding = model.encode(
-        QWEN_QUERY_PREFIX + query,
-        normalize_embeddings=True,
+        query,
+        input_type="search_query",
     )
 
     where_filter: dict[str, Any] | None = None
