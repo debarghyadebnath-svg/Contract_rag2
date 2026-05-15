@@ -14,6 +14,8 @@ env/
 *.sqlite3
 backend/chroma_contract_store/
 backend/bm25_contract_index.pkl
+backend/.parse_cache/
+backend/feature_extraction_checkpoint.db
 
 # Large Models & Embeddings
 backend/models/

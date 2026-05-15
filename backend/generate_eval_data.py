@@ -28,8 +28,8 @@ def generate_synthetic_dataset(sample_size=10, output_file="synthetic_eval_data.
     
     llm = ChatGroq(
         api_key=os.environ["GROQ_API_KEY"],
-        model_name="meta-llama/llama-4-scout-17b-16e-instruct",
-        temperature=0.3
+        model_name="qwen/qwen3-32b",
+        temperature=0.5
     )
     
     prompt = ChatPromptTemplate.from_messages([

@@ -311,11 +311,66 @@ def _extract_all_pages_local(pdf_path: Path) -> list[PageData]:
     return pages
 
 
+# ---- Cache helpers ----------------------------------------------------------
+
+import hashlib
+import json as _json
+
+_CACHE_DIR = Path(__file__).parent / ".parse_cache"
+
+
+def _pdf_hash(pdf_path: Path) -> str:
+    """SHA-256 hash of the PDF file (fast — streams in 64 KB chunks)."""
+    h = hashlib.sha256()
+    with open(pdf_path, "rb") as f:
+        for block in iter(lambda: f.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _cache_path(pdf_hash: str) -> Path:
+    _CACHE_DIR.mkdir(exist_ok=True)
+    return _CACHE_DIR / f"{pdf_hash}.json"
+
+
+def _save_to_cache(pdf_hash: str, pages: list[PageData]) -> None:
+    data = [
+        {
+            "page_number": p.page_number,
+            "text": p.text,
+            "tables": p.tables,
+        }
+        for p in pages
+    ]
+    _cache_path(pdf_hash).write_text(_json.dumps(data), encoding="utf-8")
+
+
+def _load_from_cache(pdf_hash: str) -> list[PageData] | None:
+    cp = _cache_path(pdf_hash)
+    if not cp.exists():
+        return None
+    try:
+        data = _json.loads(cp.read_text(encoding="utf-8"))
+        return [
+            PageData(
+                page_number=d["page_number"],
+                text=d["text"],
+                tables=d["tables"],
+            )
+            for d in data
+        ]
+    except Exception:
+        return None
+
+
 # ---- Unified entry point ---------------------------------------------------
 
 def _extract_all_pages(pdf_path: Path, use_cloud: bool = True) -> list[PageData]:
     """
     Extract all pages from a PDF.
+
+    Caches the result by PDF hash, so repeated runs on the same file
+    skip the parsing step entirely (loads in ~50ms instead of ~60s).
 
     Parameters
     ----------
@@ -323,16 +378,33 @@ def _extract_all_pages(pdf_path: Path, use_cloud: bool = True) -> list[PageData]
     use_cloud : if True (default), use LlamaParse cloud service.
                 Falls back automatically to pdfplumber if API key is absent.
     """
+    # ── Cache lookup ──────────────────────────────────────────────────────
+    file_hash = _pdf_hash(pdf_path)
+    cached = _load_from_cache(file_hash)
+    if cached is not None:
+        print(f"[chunker] Cache hit for '{pdf_path.name}' ({len(cached)} pages). Skipping parse.")
+        return cached
+
+    # ── Parse ─────────────────────────────────────────────────────────────
     if use_cloud:
         api_key = os.environ.get("LLAMAINDEX_API_KEY") or os.environ.get("LLAMA_CLOUD_API_KEY")
         if api_key:
-            return _extract_all_pages_cloud(pdf_path)
+            pages = _extract_all_pages_cloud(pdf_path)
         else:
             print(
                 "[chunker] LLAMAINDEX_API_KEY not set — falling back to local pdfplumber."
             )
-    print(f"[chunker] Using local pdfplumber backend for '{pdf_path.name}' …")
-    return _extract_all_pages_local(pdf_path)
+            print(f"[chunker] Using local pdfplumber backend for '{pdf_path.name}' …")
+            pages = _extract_all_pages_local(pdf_path)
+    else:
+        print(f"[chunker] Using local pdfplumber backend for '{pdf_path.name}' …")
+        pages = _extract_all_pages_local(pdf_path)
+
+    # ── Save to cache ─────────────────────────────────────────────────────
+    _save_to_cache(file_hash, pages)
+    print(f"[chunker] Cached parse result for '{pdf_path.name}' ({len(pages)} pages).")
+
+    return pages
 
 
 # ---------------------------------------------------------------------------

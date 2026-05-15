@@ -197,10 +197,15 @@ def answer_contract_query(
 
     sources = [
         {
-            "chunk_id": r["id"],
-            "chunk_type": r["metadata"].get("chunk_type", "?"),
-            "section": r["metadata"].get("section_number") or r["metadata"].get("section", "?"),
-            "snippet": r["text"][:300],
+            "chunk_id":         r["id"],
+            "chunk_type":       r["metadata"].get("chunk_type", "?"),
+            "section":          r["metadata"].get("section_number") or r["metadata"].get("section", "?"),
+            "snippet":          r["text"][:300],
+            # Extracted feature fields (populated when --extract-features was used)
+            "feat_obligation":    r["metadata"].get("feat_obligation"),
+            "feat_risk_level":    r["metadata"].get("feat_risk_level"),
+            "feat_content_type":  r["metadata"].get("feat_content_type"),
+            "feat_summary":       r["metadata"].get("feat_summary"),
         }
         for r in retrieved[:8]
     ]
