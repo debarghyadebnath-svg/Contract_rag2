@@ -1,27 +1,32 @@
 """
 contract_chunker.py
 -------------------
-3-layer chunking pipeline for the IHDA Mortgage Purchase Agreement (36 pages).
+3-layer chunking pipeline for legal / government PDF documents.
 
 Layer 1 → Definition Chunks   (Section 1 — every quoted term = 1 atomic chunk)
-Layer 2 → Section Chunks      (Sections 2–14, split at subsection boundaries)
-Layer 3 → Table Chunks        (recapture tables + worked examples, 3-format serialisation)
+Layer 2 → Section Chunks      (Sections 2–N, split at subsection boundaries)
+Layer 3 → Table Chunks        (classified tables in 3-format serialisation)
+
+PDF Extraction backends (auto-selected or forced via use_cloud flag):
+  Cloud  — LlamaParse (llama-parse)  → fast, accurate, handles complex layouts
+  Local  — pdfplumber                → offline fallback, no API key required
 
 Rules enforced per the spec:
-- pdfplumber ONLY for PDF extraction + table detection
 - No LangChain splitters — SectionAwareSplitter is fully custom
 - Every page_content starts with a bracketed breadcrumb header
 - Definition chunks have ZERO overlap (atomic + immutable)
 - Section chunks overlap 150 tokens from prev chunk tail
 - Tables are ALWAYS atomic (never split mid-row or mid-example)
 - Tables serialised in 3 formats: markdown + pipe-delimited + prose
-- Duplicate table in MCC Addendum (page 36) gets is_duplicate=True
+- Duplicate tables get is_duplicate=True
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +66,96 @@ def _tail_tokens(text: str, n_tokens: int = 150) -> str:
     return text[-char_budget:] if len(text) > char_budget else text
 
 
+# ---------------------------------------------------------------------------
+# Generalized Header Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class HeaderMatch:
+    """A detected heading in document text."""
+    level: int     # 1=chapter/section, 2=subsection, 3=deep
+    number: str    # "3.6", "Ch4", or ""
+    title: str     # clean heading text
+    start: int     # char offset in the text
+    strategy: str  # which pattern matched
+
+
+_HDR_EXPLICIT_SECTION = re.compile(
+    r'^[ \t]*Section\s+(\d{1,2})[.\s]\s*([^\n.]{3,80}?)[ \t]*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+_HDR_CHAPTER = re.compile(
+    r'^[ \t]*Chapter\s+(\d{1,2})\s*[:.\s]\s*([^\n]{3,100}?)[ \t]*$',
+    re.MULTILINE | re.IGNORECASE,
+)
+_HDR_DEEP_NUMERIC = re.compile(
+    r'^[ \t]{0,6}(\d{1,2})\.(\d{1,2})\.(\d{1,2})\.?\s+([A-Z][^\n]{2,80}?)[ \t]*$',
+    re.MULTILINE,
+)
+_HDR_SUBSECTION = re.compile(
+    r'^[ \t]{0,6}(\d{1,2})\.(\d{1,2})\.?\s+([A-Z][^\n]{2,80}?)[ \t]*$',
+    re.MULTILINE,
+)
+_HDR_ALL_CAPS = re.compile(
+    r'^[ \t]*([A-Z][A-Z\s\-\/]{4,60})[ \t]*$',
+    re.MULTILINE,
+)
+
+
+def _is_toc_line(line: str) -> bool:
+    """Return True if this looks like a Table of Contents entry."""
+    return bool(re.search(r'\.{4,}\s*\d+\s*$', line.strip()))
+
+
+def _detect_headers(text: str) -> list[HeaderMatch]:
+    """
+    Multi-strategy header detector for generic PDFs.
+    Returns HeaderMatch objects sorted by position.
+
+    Strategies (in priority order):
+      S1 - Explicit 'Section N.' lines  -> level 1
+      S2 - 'Chapter N:' lines           -> level 1
+      S3 - Deep numeric 'N.N.N.'        -> level 3
+      S4 - Subsection 'N.N.'            -> level 2
+      S5 - ALL CAPS standalone line     -> level 1
+    """
+    result: dict[int, HeaderMatch] = {}
+
+    def _add(m: re.Match, level: int, number: str, title: str, strategy: str) -> None:
+        title = title.strip().rstrip('.')
+        if not title or _is_toc_line(m.group(0)):
+            return
+        if m.start() not in result:
+            result[m.start()] = HeaderMatch(
+                level=level, number=number, title=title,
+                start=m.start(), strategy=strategy,
+            )
+
+    for m in _HDR_EXPLICIT_SECTION.finditer(text):
+        _add(m, 1, m.group(1), m.group(2), "S1_section")
+    for m in _HDR_CHAPTER.finditer(text):
+        _add(m, 1, f"Ch{m.group(1)}", m.group(2), "S2_chapter")
+    for m in _HDR_DEEP_NUMERIC.finditer(text):
+        _add(m, 3, f"{m.group(1)}.{m.group(2)}.{m.group(3)}", m.group(4), "S3_deep")
+    for m in _HDR_SUBSECTION.finditer(text):
+        if m.start() not in result:
+            _add(m, 2, f"{m.group(1)}.{m.group(2)}", m.group(3), "S4_subsec")
+    for m in _HDR_ALL_CAPS.finditer(text):
+        if m.start() in result:
+            continue
+        title = m.group(1).strip()
+        if len(title.split()) < 2 and len(title) < 8:
+            continue
+        if _is_toc_line(m.group(0)):
+            continue
+        result[m.start()] = HeaderMatch(
+            level=1, number="", title=title,
+            start=m.start(), strategy="S5_caps",
+        )
+
+    return sorted(result.values(), key=lambda h: h.start)
+
+
 def _build_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     col_w = [max(len(h), max((len(r[i]) for r in rows), default=0)) for i, h in enumerate(headers)]
     sep = "|" + "|".join("-" * (w + 2) for w in col_w) + "|"
@@ -77,30 +172,167 @@ def _build_pipe_row(headers: list[str], rows: list[list[str]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PDF extraction — pdfplumber only
+# PDF extraction — two backends: LlamaParse (cloud) and pdfplumber (local)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class PageData:
     page_number: int
     text: str
-    tables: list[list[list[str | None]]]  # list of pdfplumber table rows
+    tables: list[list[list[str | None]]]  # list of table rows (cells as strings)
 
 
-def _extract_all_pages(pdf_path: Path) -> list[PageData]:
+# ---- Markdown table → cell grid converter (used after LlamaParse) ----------
+
+def _md_table_to_grid(md_table: str) -> list[list[str]]:
+    """
+    Convert a markdown table string into a list-of-rows grid.
+    Handles separator lines (|---|---|) gracefully.
+    Returns an empty list if the string is not a recognisable table.
+    """
+    rows: list[list[str]] = []
+    for raw_line in md_table.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("|"):
+            continue
+        # Skip pure separator rows like |---|---|
+        inner = line.strip("|")
+        if re.fullmatch(r"[\s\-:|]+", inner):
+            continue
+        cells = [c.strip() for c in inner.split("|")]
+        rows.append(cells)
+    return rows
+
+
+# ---- Cloud backend — LlamaParse --------------------------------------------
+
+def _extract_all_pages_cloud(pdf_path: Path) -> list[PageData]:
+    """
+    Parse the PDF via LlamaParse cloud service.
+    Returns one PageData per page, with text and tables populated from
+    LlamaParse's structured JSON output.
+
+    Requires the environment variable LLAMAINDEX_API_KEY (loaded from .env).
+    """
+    try:
+        from llama_parse import LlamaParse  # type: ignore[import]
+    except ImportError:
+        raise ImportError(
+            "llama-parse is not installed. Run: pip install llama-parse"
+        )
+
+    api_key = os.environ.get("LLAMAINDEX_API_KEY") or os.environ.get("LLAMA_CLOUD_API_KEY")
+    if not api_key:
+        raise EnvironmentError(
+            "[chunker] LLAMAINDEX_API_KEY not found in environment. "
+            "Add it to your .env file or use the local pdfplumber backend."
+        )
+
+    print(f"[chunker] Using LlamaParse cloud backend for '{pdf_path.name}' …")
+
+    parser = LlamaParse(
+        api_key=api_key,
+        result_type="markdown",          # also gives us per-page JSON
+        verbose=False,
+        language="en",
+        # Instruct the model to preserve table structures faithfully
+        parsing_instruction=(
+            "Extract the document faithfully. "
+            "Preserve all tables as proper markdown tables. "
+            "Keep section numbering and heading hierarchy intact."
+        ),
+    )
+
+    # get_json_result returns a list of dicts, one per uploaded file.
+    # Each dict has a 'pages' key → list of per-page objects.
+    json_results = parser.get_json_result(str(pdf_path))
+    if not json_results:
+        raise RuntimeError("[chunker] LlamaParse returned empty results.")
+
+    raw_pages: list[dict] = json_results[0].get("pages", [])
+    print(f"[chunker] LlamaParse returned {len(raw_pages)} pages.")
+
+    pages: list[PageData] = []
+    for rp in raw_pages:
+        page_num: int = rp.get("page", len(pages) + 1)
+        # Prefer the plain-text field; fall back to markdown
+        text: str = rp.get("text") or rp.get("md") or ""
+
+        # Extract tables from the structured 'items' list when available
+        tables: list[list[list[str]]] = []
+        for item in rp.get("items", []):
+            itype = (item.get("type") or "").lower()
+            if itype == "table":
+                # Items expose the table as markdown in 'value' or 'md'
+                md_src = item.get("value") or item.get("md") or ""
+                grid = _md_table_to_grid(md_src)
+                if grid:
+                    tables.append(grid)
+
+        # Fallback: scan page markdown for fenced tables when items are absent
+        if not tables:
+            page_md: str = rp.get("md") or ""
+            # Collect contiguous markdown table blocks
+            current_block: list[str] = []
+            for line in page_md.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("|"):
+                    current_block.append(line)
+                else:
+                    if current_block:
+                        grid = _md_table_to_grid("\n".join(current_block))
+                        if grid:
+                            tables.append(grid)
+                        current_block = []
+            if current_block:
+                grid = _md_table_to_grid("\n".join(current_block))
+                if grid:
+                    tables.append(grid)
+
+        pages.append(PageData(page_number=page_num, text=text, tables=tables))
+
+    return pages
+
+
+# ---- Local backend — pdfplumber -------------------------------------------
+
+def _extract_all_pages_local(pdf_path: Path) -> list[PageData]:
+    """Original pdfplumber-based extractor (offline, no API key needed)."""
     pages: list[PageData] = []
     with pdfplumber.open(str(pdf_path)) as pdf:
         for i, page in enumerate(pdf.pages, start=1):
-            # Use layout=True to preserve column/indentation structure
             text = page.extract_text(layout=True) or ""
             tables = page.extract_tables() or []
-            # Replace None cells with empty string
             clean_tables = [
                 [[cell or "" for cell in row] for row in table]
                 for table in tables
             ]
             pages.append(PageData(page_number=i, text=text, tables=clean_tables))
     return pages
+
+
+# ---- Unified entry point ---------------------------------------------------
+
+def _extract_all_pages(pdf_path: Path, use_cloud: bool = True) -> list[PageData]:
+    """
+    Extract all pages from a PDF.
+
+    Parameters
+    ----------
+    pdf_path  : path to the PDF file
+    use_cloud : if True (default), use LlamaParse cloud service.
+                Falls back automatically to pdfplumber if API key is absent.
+    """
+    if use_cloud:
+        api_key = os.environ.get("LLAMAINDEX_API_KEY") or os.environ.get("LLAMA_CLOUD_API_KEY")
+        if api_key:
+            return _extract_all_pages_cloud(pdf_path)
+        else:
+            print(
+                "[chunker] LLAMAINDEX_API_KEY not set — falling back to local pdfplumber."
+            )
+    print(f"[chunker] Using local pdfplumber backend for '{pdf_path.name}' …")
+    return _extract_all_pages_local(pdf_path)
 
 
 # ---------------------------------------------------------------------------
@@ -233,20 +465,20 @@ def _split_section_into_subsections(
     prev_chunk_ids: list[str],
 ) -> list[Chunk]:
     """
-    Split one Section into subsection chunks.
-    Handles Section 10.2 warranties by grouping 8-10 items per sub-chunk.
-    Returns list of Chunk objects with prev/next linkage.
+    Split one section into subsection chunks using generalized _detect_headers().
+    Works for any heading style (Chapter N, N.N., Section N, ALL CAPS, etc.).
+    Retains backward-compat special handling for IHDA Section 10.2 warranties.
     """
-    # Detect subsections inside section body
-    sub_matches = list(_SUBSEC_PATTERN.finditer(section_body))
+    sub_headers = [h for h in _detect_headers(section_body) if h.level >= 2]
 
-    # If no subsections, treat the whole section as one chunk
-    if not sub_matches:
-        chunk_id = f"sec_{section_num}_main"
-        breadcrumb = f"[IHDA Agreement | Section {section_num} — {section_title} | Obligations of: {_detect_obligation(section_body)}]"
+    if not sub_headers:
+        sec_label = f"{section_num} \u2014 " if section_num else ""
+        chunk_id = f"sec_{_slugify(section_num or section_title)}_main"
+        breadcrumb = (
+            f"[Document | {sec_label}{section_title}"
+            f" | Obligations of: {_detect_obligation(section_body)}]"
+        )
         page_content = f"{breadcrumb}\n\n{section_body.strip()}"
-
-        # Split if over MAX_TOKENS
         return _maybe_split_oversized(
             page_content, section_num, section_title, chunk_id, page_range,
         )
@@ -254,32 +486,29 @@ def _split_section_into_subsections(
     chunks: list[Chunk] = []
     prev_tail = ""
 
-    for idx, m in enumerate(sub_matches):
-        sub_major = m.group(1)
-        sub_minor = m.group(2)
-        sub_title = m.group(3).strip()
-        subsec_num = f"{sub_major}.{sub_minor}"
-        body_start = m.start()
-        body_end = sub_matches[idx + 1].start() if idx + 1 < len(sub_matches) else len(section_body)
+    for idx, sh in enumerate(sub_headers):
+        sub_title = sh.title
+        subsec_num = sh.number
+        body_start = sh.start
+        body_end = sub_headers[idx + 1].start if idx + 1 < len(sub_headers) else len(section_body)
         raw_body = section_body[body_start:body_end].strip()
 
-        # Special handling: Section 10.2 warranties
-        is_warranty_section = section_num == "10" and sub_minor == "2"
-        if is_warranty_section:
-            warranty_chunks = _split_warranty_chunk(
-                section_num, sub_title, raw_body, page_range, subsec_num
-            )
-            chunks.extend(warranty_chunks)
+        # Backward compat: IHDA Section 10.2 warranties
+        parent_num = section_num.split(".")[0] if "." in section_num else section_num
+        if parent_num == "10" and subsec_num.endswith(".2"):
+            chunks.extend(_split_warranty_chunk(
+                parent_num, sub_title, raw_body, page_range, subsec_num
+            ))
             continue
 
-        # Add overlap prefix from previous chunk tail
         overlap = f"[...continued from previous]\n{prev_tail}\n\n" if prev_tail else ""
+        sec_label = f"{subsec_num} \u2014 " if subsec_num else ""
         breadcrumb = (
-            f"[IHDA Agreement | Section {subsec_num} — {sub_title} | "
-            f"Obligations of: {_detect_obligation(raw_body)}]"
+            f"[Document | {sec_label}{sub_title}"
+            f" | Obligations of: {_detect_obligation(raw_body)}]"
         )
         page_content = f"{breadcrumb}\n\n{overlap}{raw_body}"
-        chunk_id = f"sec_{sub_major}_{sub_minor}_{_slugify(sub_title)}"
+        chunk_id = f"sec_{_slugify(subsec_num or sub_title)}"
 
         chunks.append(Chunk(
             page_content=page_content,
@@ -296,13 +525,13 @@ def _split_section_into_subsections(
                 "retrieval_priority": "high",
                 "token_count": _token_count(page_content),
                 "contains_table": False,
+                "header_strategy": sh.strategy,
                 "prev_chunk_id": chunks[-1].metadata["chunk_id"] if chunks else (prev_chunk_ids[-1] if prev_chunk_ids else ""),
-                "next_chunk_id": "",  # filled in after all chunks built
+                "next_chunk_id": "",
             },
         ))
         prev_tail = _tail_tokens(raw_body, OVERLAP_TOKENS)
 
-    # Back-fill next_chunk_id links
     for i in range(len(chunks) - 1):
         chunks[i].metadata["next_chunk_id"] = chunks[i + 1].metadata["chunk_id"]
 
@@ -469,32 +698,53 @@ def _approximate_page_range(text_start: int, text_end: int, pages: list[PageData
 
 
 def _layer2_section_chunks(pages: list[PageData]) -> list[Chunk]:
+    """
+    Build section/subsection chunks using generalized header detection.
+    Works for any document structure (Chapter N, Section N, N.N., ALL CAPS, etc.).
+    """
     joined = "\n".join(p.text for p in pages)
-    sec2_match = re.search(r'Section\s+2[\.\s]', joined, re.IGNORECASE)
-    if not sec2_match:
-        return []
+    all_headers = _detect_headers(joined)
 
-    sections_text = joined[sec2_match.start():]
-    section_matches = list(_SECTION_PATTERN.finditer(sections_text))
+    # Level-1 headers define top-level sections
+    level1 = [h for h in all_headers if h.level == 1]
+    if not level1:
+        return []
 
     all_chunks: list[Chunk] = []
     prev_chunk_ids: list[str] = []
+    seen_ids: dict[str, int] = {}
 
-    for idx, sm in enumerate(section_matches):
-        sec_num = sm.group(1)
-        sec_title = sm.group(2).strip()
-        sec_start = sm.start()
-        sec_end = section_matches[idx + 1].start() if idx + 1 < len(section_matches) else len(sections_text)
-        sec_body = sections_text[sec_start:sec_end]
-
-        # Approx page range
-        abs_start = sec2_match.start() + sec_start
-        abs_end = sec2_match.start() + sec_end
-        page_range = _approximate_page_range(abs_start, abs_end, pages)
+    for idx, h1 in enumerate(level1):
+        sec_start = h1.start
+        sec_end = level1[idx + 1].start if idx + 1 < len(level1) else len(joined)
+        sec_body = joined[sec_start:sec_end]
+        page_range = _approximate_page_range(sec_start, sec_end, pages)
 
         new_chunks = _split_section_into_subsections(
-            sec_num, sec_title, sec_body, page_range, prev_chunk_ids
+            h1.number, h1.title, sec_body, page_range, prev_chunk_ids
         )
+        
+        # Deduplicate chunk IDs
+        for c in new_chunks:
+            base_id = c.metadata["chunk_id"]
+            if base_id in seen_ids:
+                seen_ids[base_id] += 1
+                c.metadata["chunk_id"] = f"{base_id}_dup{seen_ids[base_id]}"
+            else:
+                seen_ids[base_id] = 0
+
+        # Fix prev/next links for the new chunks
+        for i in range(len(new_chunks)):
+            if i > 0:
+                new_chunks[i].metadata["prev_chunk_id"] = new_chunks[i-1].metadata["chunk_id"]
+            if i < len(new_chunks) - 1:
+                new_chunks[i].metadata["next_chunk_id"] = new_chunks[i+1].metadata["chunk_id"]
+                
+        # Link the first chunk to the last chunk of the previous batch
+        if all_chunks and new_chunks:
+            new_chunks[0].metadata["prev_chunk_id"] = all_chunks[-1].metadata["chunk_id"]
+            all_chunks[-1].metadata["next_chunk_id"] = new_chunks[0].metadata["chunk_id"]
+
         all_chunks.extend(new_chunks)
         prev_chunk_ids = [c.metadata["chunk_id"] for c in new_chunks]
 
@@ -517,10 +767,226 @@ _EXAMPLE_PATTERN = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Generalized Table Classification
+# ---------------------------------------------------------------------------
+
+class TableKind(Enum):
+    """Classification of a table extracted from a PDF page."""
+    SKIP      = "skip"        # noise/empty — do not chunk
+    KEY_VALUE = "key_value"   # 2-col pairs: Risk/Mitigation, Term/Definition
+    SCORING   = "scoring"     # numeric %, scores, weightings
+    CRITERIA  = "criteria"    # evaluation criteria / sub-criteria
+    REFERENCE = "reference"   # regulatory / legal cross-references
+    GENERIC   = "generic"     # any other multi-row, multi-col table
+
+
+def _looks_like_header(row: list[str]) -> bool:
+    """Heuristic: header rows tend to have short, capitalized cells."""
+    non_empty = [c for c in row if c]
+    if not non_empty:
+        return False
+    avg_words = sum(len(c.split()) for c in non_empty) / len(non_empty)
+    caps_ratio = sum(1 for c in non_empty if c == c.upper() or c.istitle()) / len(non_empty)
+    return avg_words <= 5 or caps_ratio >= 0.5
+
+
+def classify_table(table: list[list[str]]) -> TableKind:
+    """
+    Classify a pdfplumber table without document-specific hardcoding.
+    Works across government manuals, legal agreements, policy documents, etc.
+
+    Classification order (first match wins):
+      SKIP      - too few rows/cols or mostly empty
+      SCORING   - score / weighting / % in header
+      CRITERIA  - criteria / evaluation in header
+      REFERENCE - regulatory clause/rule references in header
+      KEY_VALUE - 2-column with short first-column entries
+      GENERIC   - everything else worth keeping
+    """
+    data_rows = [
+        [cell.strip() for cell in row]
+        for row in table
+        if any(cell.strip() for cell in row)
+    ]
+    if len(data_rows) < 2:
+        return TableKind.SKIP
+    ncols = max(len(row) for row in data_rows)
+    if ncols < 2:
+        return TableKind.SKIP
+    total_cells = sum(len(row) for row in data_rows)
+    non_empty = sum(1 for row in data_rows for cell in row if cell)
+    if total_cells > 0 and non_empty / total_cells < 0.15:
+        return TableKind.SKIP
+
+    header_flat = " ".join(c.lower() for c in data_rows[0] if c)
+    all_flat    = " ".join(c.lower() for row in data_rows for c in row if c)
+
+    # SCORING: percentage / score / weighting columns
+    if re.search(r'\b(?:score|weighting|weight|marks|percentage|%|rating)\b', header_flat):
+        return TableKind.SCORING
+    # Backward compat: IHDA recapture table (no explicit header keyword)
+    if "percentage" in all_flat and any(ord_ in all_flat for ord_ in _ORDINAL_TO_YEAR):
+        return TableKind.SCORING
+
+    # CRITERIA: evaluation / sub-criteria tables
+    if re.search(r'\b(?:criteria|sub[- ]criteria|evaluation|parameter|indicator)\b', header_flat):
+        return TableKind.CRITERIA
+
+    # REFERENCE: regulatory / legal reference tables
+    if re.search(r'\b(?:rule\s*\d|gfr|clause|schedule|appendix|annexure|article)\b', header_flat):
+        return TableKind.REFERENCE
+
+    # KEY_VALUE: 2-column with reasonably short first-column entries
+    if ncols == 2:
+        avg_first_col = sum(len(r[0].split()) for r in data_rows if len(r) >= 1) / len(data_rows)
+        if avg_first_col <= 10:
+            return TableKind.KEY_VALUE
+
+    return TableKind.GENERIC
+
+
+def _table_signature(table: list[list[str]]) -> str:
+    """Compact fingerprint for table deduplication."""
+    flat = "|".join(cell.strip() for row in table for cell in row if cell.strip())
+    return flat[:300]
+
+
+def _extract_heading_context(page_text: str) -> str:
+    """Return the last detected heading on a page, used as breadcrumb context."""
+    headers = _detect_headers(page_text)
+    if not headers:
+        return ""
+    h = headers[-1]
+    return f"{h.number} {h.title}".strip() if h.number else h.title
+
+
 def _is_recapture_table(table: list[list[str]]) -> bool:
-    """Detect if a table is the recapture percentage table."""
-    flat = " ".join(cell.lower() for row in table for cell in row if cell)
-    return "percentage" in flat and any(ord_ in flat for ord_ in _ORDINAL_TO_YEAR)
+    """Kept for backward compatibility — delegates to classify_table()."""
+    return classify_table(table) == TableKind.SCORING
+
+
+def _serialize_generic_table(
+    table: list[list[str]],
+    kind: TableKind,
+    context_heading: str,
+    page_num: int,
+    is_duplicate: bool = False,
+    table_index: int = 0,
+) -> Chunk:
+    """
+    Unified table serializer for any TableKind.
+    - Always produces Markdown.
+    - KEY_VALUE  -> also Prose  (Col1: Col2 | ...).
+    - SCORING / CRITERIA -> also Pipe (H1=val | H2=val || ...).
+    - SCORING tables matching the IHDA recapture pattern -> delegate to
+      _serialize_recapture_table for full backward compatibility.
+    """
+    data_rows = [
+        [cell.strip() for cell in row]
+        for row in table
+        if any(cell.strip() for cell in row)
+    ]
+    # Delegate IHDA recapture tables to original serializer
+    if kind == TableKind.SCORING:
+        all_flat = " ".join(c.lower() for row in data_rows for c in row if c)
+        if any(ord_ in all_flat for ord_ in _ORDINAL_TO_YEAR):
+            examples = _extract_example_text_near_table(context_heading)  # empty string fallback
+            return _serialize_recapture_table(table, "", page_num, is_duplicate)
+
+    # Detect header row
+    if len(data_rows) > 1 and _looks_like_header(data_rows[0]):
+        headers, rows = data_rows[0], data_rows[1:]
+    else:
+        ncols = max(len(r) for r in data_rows) if data_rows else 2
+        headers = [f"Col {i+1}" for i in range(ncols)]
+        rows = data_rows
+
+    ncols = len(headers)
+    rows = [(r + [""] * ncols)[:ncols] for r in rows]
+
+    md = _build_markdown_table(headers, rows)
+
+    pipe_str = ""
+    if kind in (TableKind.SCORING, TableKind.CRITERIA):
+        pipe_parts = [
+            " | ".join(f"{h}={cell}" for h, cell in zip(headers, row) if cell)
+            for row in rows
+        ]
+        pipe_str = "PIPE: " + " || ".join(p for p in pipe_parts if p)
+
+    prose_str = ""
+    if kind == TableKind.KEY_VALUE and ncols == 2:
+        items = [f"{r[0]}: {r[1]}" for r in rows if r[0] and r[1]]
+        prose_str = "PROSE: " + " | ".join(items)
+
+    ctx = f" | Near: {context_heading}" if context_heading else ""
+    breadcrumb = f"[Document | Table ({kind.value}) | Page {page_num}{ctx}]"
+    parts = [f"MARKDOWN:\n{md}"]
+    if pipe_str:
+        parts.append(pipe_str)
+    if prose_str:
+        parts.append(prose_str)
+    page_content = f"{breadcrumb}\n\n" + "\n\n".join(parts)
+
+    dup_sfx = "_dup" if is_duplicate else ""
+    chunk_id = f"table_p{page_num}_t{table_index}_{kind.value}{dup_sfx}"
+
+    return Chunk(
+        page_content=page_content,
+        metadata={
+            "chunk_id": chunk_id,
+            "chunk_type": "table",
+            "table_kind": kind.value,
+            "doc_source": "main",
+            "page_range": [page_num, page_num],
+            "contains_table": True,
+            "context_heading": context_heading,
+            "serialization_formats": (
+                ["markdown"]
+                + (["pipe"] if pipe_str else [])
+                + (["prose"] if prose_str else [])
+            ),
+            "retrieval_priority": "high",
+            "token_count": _token_count(page_content),
+            "is_duplicate": is_duplicate,
+            **({"canonical_chunk_id": chunk_id.replace("_dup", "")} if is_duplicate else {}),
+        },
+    )
+
+
+def _layer3_table_chunks(pages: list[PageData]) -> list[Chunk]:
+    """
+    Generalized table chunker.
+    Classifies every table on every page using classify_table().
+    Skips SKIP-kind tables; serializes all others with _serialize_generic_table().
+    Tracks seen table signatures across pages to flag duplicates.
+    """
+    chunks: list[Chunk] = []
+    seen_sigs: set[str] = set()
+
+    for page in pages:
+        if not page.tables:
+            continue
+        context = _extract_heading_context(page.text)
+        for t_idx, table in enumerate(page.tables):
+            kind = classify_table(table)
+            if kind == TableKind.SKIP:
+                continue
+            sig = _table_signature(table)
+            is_dup = sig in seen_sigs
+            seen_sigs.add(sig)
+            chunk = _serialize_generic_table(
+                table=table,
+                kind=kind,
+                context_heading=context,
+                page_num=page.page_number,
+                is_duplicate=is_dup,
+                table_index=t_idx,
+            )
+            chunks.append(chunk)
+
+    return chunks
 
 
 def _serialize_recapture_table(
@@ -613,23 +1079,6 @@ def _extract_example_text_near_table(page_text: str) -> str:
     return page_text[start:].strip()
 
 
-def _layer3_table_chunks(pages: list[PageData]) -> list[Chunk]:
-    chunks: list[Chunk] = []
-    recapture_seen = False
-
-    for page in pages:
-        for table in page.tables:
-            if not _is_recapture_table(table):
-                continue
-            examples = _extract_example_text_near_table(page.text)
-            is_dup = recapture_seen  # second occurrence = duplicate
-            chunk = _serialize_recapture_table(table, examples, page.page_number, is_dup)
-            chunks.append(chunk)
-            recapture_seen = True
-
-    return chunks
-
-
 # ---------------------------------------------------------------------------
 # SectionAwareSplitter — the main public interface
 # ---------------------------------------------------------------------------
@@ -640,8 +1089,18 @@ class SectionAwareSplitter:
     Call split(pdf_path) to get back a list[Chunk].
     """
 
-    def split(self, pdf_path: Path) -> list[Chunk]:
-        pages = _extract_all_pages(pdf_path)
+    def split(self, pdf_path: Path, use_cloud: bool = True) -> list[Chunk]:
+        """
+        Parse a PDF and produce all chunk layers.
+
+        Parameters
+        ----------
+        pdf_path  : path to the PDF file
+        use_cloud : forward to _extract_all_pages; uses LlamaParse when True
+                    (default) and LLAMAINDEX_API_KEY is present, otherwise
+                    falls back to local pdfplumber automatically.
+        """
+        pages = _extract_all_pages(pdf_path, use_cloud=use_cloud)
 
         layer1 = _layer1_definition_chunks(pages)
         layer2 = _layer2_section_chunks(pages)

@@ -19,7 +19,7 @@ from typing import Any
 
 from groq import Groq
 
-from contract_embedder import BGE_QUERY_PREFIX, _get_collection, _get_model, load_bm25_index
+from contract_embedder import QWEN_QUERY_PREFIX, _get_collection, _get_model, load_bm25_index
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -105,9 +105,9 @@ def retrieve_contract(
 
     # --- Dense retrieval via Chroma
     query_embedding = model.encode(
-        BGE_QUERY_PREFIX + query,
+        QWEN_QUERY_PREFIX + query,
         normalize_embeddings=True,
-    ).tolist()
+    )
 
     where_filter: dict[str, Any] | None = None
     if chunk_type_filter:

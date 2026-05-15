@@ -5,17 +5,18 @@ from typing import Any
 # Naya tareeka (Standard)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
-from langchain_nomic.embeddings import NomicEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse
 from qdrant_client import QdrantClient, models
 from qdrant_client.http.models import Distance, VectorParams
 
 from pdf_parser import normalize_policy_name
 
-# Using Nomic API directly
-EMBEDDING_MODEL = "nomic-embed-text-v1.5"
-VECTOR_SIZE = 768
+# Using Qwen3-Embedding-0.6B via HuggingFace
+EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+VECTOR_SIZE = 1024
 COLLECTION_NAME = "insurance_policies"
+MODELS_DIR = Path(__file__).parent / "models"
 
 
 def _get_qdrant_client() -> QdrantClient:
@@ -62,7 +63,7 @@ def index_pdf_pages(
     policy_name: str | None = None,
 ) -> None:
     """
-    Chunk the extracted pages, embed with Nomic API (nomic-embed-text),
+    Chunk the extracted pages, embed with Qwen3-Embedding-0.6B,
     and upsert into Qdrant with metadata for citation.
     """
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
@@ -86,7 +87,12 @@ def index_pdf_pages(
     if not documents:
         return
 
-    embeddings = NomicEmbeddings(model=EMBEDDING_MODEL, nomic_api_key=os.environ.get("NOMIC_API_KEY"))
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        cache_folder=str(MODELS_DIR),
+        model_kwargs={"trust_remote_code": True}
+    )
     sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
     
     client = _get_qdrant_client()

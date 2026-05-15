@@ -1,16 +1,27 @@
 import argparse
 import os
 import time
+from pathlib import Path
 import matplotlib.pyplot as plt
 from ranx import evaluate, Run
 
-from langchain_nomic.embeddings import NomicEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_cohere import CohereRerank
 from langchain_core.documents import Document
 
-from eval_lancedb import setup_lancedb, load_data
+from embedder import EMBEDDING_MODEL, MODELS_DIR
+# Note: eval_lancedb might be missing, this script is updated for model consistency
+try:
+    from eval_lancedb import setup_lancedb, load_data
+except ImportError:
+    setup_lancedb = None
+    load_data = None
 
 def main():
+    if setup_lancedb is None or load_data is None:
+        print("Error: eval_lancedb.py not found. This script requires it to run.")
+        return
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-file", default="aligned_eval_data.jsonl")
     args = parser.parse_args()
@@ -22,10 +33,11 @@ def main():
     queries_dict, qrels = load_data(args.data_file)
     
     # Initialize Models
-    embeddings = NomicEmbeddings(
-        model="nomic-embed-text-v1.5", 
-        nomic_api_key=os.environ.get("NOMIC_API_KEY"),
-       
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        cache_folder=str(MODELS_DIR),
+        model_kwargs={"trust_remote_code": True}
     )
     reranker = CohereRerank(
         cohere_api_key=os.environ.get("COHERE_API_KEY"), 

@@ -2,14 +2,14 @@ import os
 import re
 from typing import Any
 
-from langchain_nomic.embeddings import NomicEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from qdrant_client import QdrantClient, models
 
-from embedder import EMBEDDING_MODEL, COLLECTION_NAME
+from embedder import EMBEDDING_MODEL, COLLECTION_NAME, MODELS_DIR
 
 RAG_SYSTEM_PROMPT = """\
 You are a professional Insurance Analysis Assistant helping Indian users understand and compare their insurance policies. Your goal is to translate technical data into functional "jobs" that the policy performs for the user, summarizing policy details with high clarity and precision.
@@ -65,7 +65,12 @@ def _build_context(docs: list[Any]) -> str:
 
 def retrieve_documents(query: str, manual_ids: list[int] | None = None) -> list[Any]:
     """Retrieve the top matching chunks for a question."""
-    embeddings = NomicEmbeddings(model=EMBEDDING_MODEL, nomic_api_key=os.environ.get("NOMIC_API_KEY"))
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL,
+        cache_folder=str(MODELS_DIR),
+        model_kwargs={"trust_remote_code": True}
+    )
     sparse_embeddings = FastEmbedSparse(model_name="Qdrant/bm25")
     
     client = QdrantClient(

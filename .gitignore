@@ -1,1 +1,30 @@
 .env
+.env*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Databases & Indices
+*.db
+*.sqlite3
+backend/chroma_contract_store/
+backend/bm25_contract_index.pkl
+
+# Large Models & Embeddings
+backend/models/
+backend/fine_tuned_insurance_embeddings/
+
+# Data Files & Documents
+*.pdf
+*.csv
+*.xlsx
+backend/uploads/
+
+# OS generated files
+.DS_Store
+Thumbs.db

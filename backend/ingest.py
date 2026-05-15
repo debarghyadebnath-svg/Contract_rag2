@@ -4,14 +4,20 @@ ingest.py
 Single entry point for the contract RAG ingestion pipeline.
 
 Usage:
-    python ingest.py contract.pdf
+    python ingest.py contract.pdf            # cloud (LlamaParse) — default
+    python ingest.py contract.pdf --local    # local pdfplumber (no API key needed)
+
     # or from Python:
     from ingest import ingest
-    ingest(Path("contract.pdf"))
+    ingest(Path("contract.pdf"), use_cloud=True)
+
+Extraction backends:
+  Cloud  — LlamaParse: fast, handles complex tables/layouts, needs LLAMAINDEX_API_KEY
+  Local  — pdfplumber: offline fallback, no API key required
 
 Runs sequentially:
   1. SectionAwareSplitter  → Layer 1 (definitions) + Layer 2 (sections) + Layer 3 (tables)
-  2. contract_embedder     → BGE-large-en-v1.5 → Chroma + BM25
+  2. contract_embedder     → qwen3-embedding:0.6b → Chroma + BM25
 """
 
 from __future__ import annotations
@@ -27,15 +33,16 @@ from contract_chunker import SectionAwareSplitter
 from contract_embedder import embed_and_index
 
 
-def ingest(pdf_path: str | Path) -> None:
+def ingest(pdf_path: str | Path, use_cloud: bool = True) -> None:
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    print(f"\n=== Ingesting: {pdf_path.name} ===\n")
+    backend = "LlamaParse (cloud)" if use_cloud else "pdfplumber (local)"
+    print(f"\n=== Ingesting: {pdf_path.name} | Backend: {backend} ===\n")
 
     splitter = SectionAwareSplitter()
-    chunks = splitter.split(pdf_path)
+    chunks = splitter.split(pdf_path, use_cloud=use_cloud)
 
     print(f"\n[ingest] Total chunks produced: {len(chunks)}")
     for chunk_type in ("definition", "section", "table"):
@@ -48,6 +55,9 @@ def ingest(pdf_path: str | Path) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python ingest.py <path_to_contract.pdf>")
+        print("Usage: python ingest.py <path_to_contract.pdf> [--local]")
         sys.exit(1)
-    ingest(sys.argv[1])
+
+    use_cloud = "--local" not in sys.argv
+    ingest(sys.argv[1], use_cloud=use_cloud)
+
